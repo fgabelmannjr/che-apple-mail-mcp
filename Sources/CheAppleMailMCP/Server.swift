@@ -50,11 +50,12 @@ class CheAppleMailMCPServer {
             // Mailbox Tools
             Tool(
                 name: "list_mailboxes",
-                description: "List all mailboxes (folders) for an account",
+                description: "List all mailboxes (folders) for an account. When listing all accounts, results are served from a durable cache for speed. Use refresh=true to force re-query.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
-                        "account_name": .object(["type": .string("string"), "description": .string("The name of the mail account (optional, lists all if omitted)")])
+                        "account_name": .object(["type": .string("string"), "description": .string("The name of the mail account (optional, lists all if omitted)")]),
+                        "refresh": .object(["type": .string("boolean"), "description": .string("Force refresh the mailbox cache (default: false)")])
                     ])
                 ])
             ),
@@ -86,13 +87,15 @@ class CheAppleMailMCPServer {
             // Email Reading Tools
             Tool(
                 name: "list_emails",
-                description: "List emails in a mailbox. Omit account_name for local/top-level mailboxes (e.g., 'For Follow Up').",
+                description: "List emails in a mailbox. Omit account_name for local/top-level mailboxes (e.g., 'For Follow Up'). Supports date filtering with since_date/before_date.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
                         "mailbox": .object(["type": .string("string"), "description": .string("Mailbox name (e.g., 'INBOX', 'For Follow Up')")]),
                         "account_name": .object(["type": .string("string"), "description": .string("The mail account (optional — omit for local/top-level mailboxes)")]),
-                        "limit": .object(["type": .string("integer"), "description": .string("Maximum number of emails to return (default: 50)")])
+                        "limit": .object(["type": .string("integer"), "description": .string("Maximum number of emails to return (default: 50)")]),
+                        "since_date": .object(["type": .string("string"), "description": .string("Only return emails received on or after this date (YYYY-MM-DD)")]),
+                        "before_date": .object(["type": .string("string"), "description": .string("Only return emails received before this date (YYYY-MM-DD)")])
                     ]),
                     "required": .array([.string("mailbox")])
                 ])
@@ -484,6 +487,32 @@ class CheAppleMailMCPServer {
                 ])
             ),
 
+            // Cross-Account Tools
+            Tool(
+                name: "search_all_mailboxes",
+                description: "Search a specific mailbox name (e.g., 'Trash', 'INBOX') across ALL accounts in one call. Returns emails with account_name so you know where each was found. Uses parallel execution for speed.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "mailbox": .object(["type": .string("string"), "description": .string("Mailbox name to search across all accounts (e.g., 'Trash', 'INBOX')")]),
+                        "limit": .object(["type": .string("integer"), "description": .string("Maximum emails per account (default: 25)")])
+                    ]),
+                    "required": .array([.string("mailbox")])
+                ])
+            ),
+            Tool(
+                name: "count_emails",
+                description: "Get the message count for a mailbox. Lightweight — returns just the count, no message data.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "mailbox": .object(["type": .string("string"), "description": .string("Mailbox name")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("The mail account (optional — omit for local mailboxes)")])
+                    ]),
+                    "required": .array([.string("mailbox")])
+                ])
+            ),
+
             Tool(
                 name: "get_email_headers",
                 description: "Get all headers of an email",
@@ -673,7 +702,8 @@ class CheAppleMailMCPServer {
         // Mailbox Tools
         case "list_mailboxes":
             let accountName = arguments["account_name"]?.stringValue
-            let mailboxes = try await mailController.listMailboxes(accountName: accountName)
+            let refresh = arguments["refresh"]?.boolValue ?? false
+            let mailboxes = try await mailController.listMailboxes(accountName: accountName, refresh: refresh)
             return formatJSON(mailboxes)
 
         case "create_mailbox":
@@ -697,7 +727,9 @@ class CheAppleMailMCPServer {
             }
             let accountName = arguments["account_name"]?.stringValue
             let limit = arguments["limit"]?.intValue ?? 50
-            let emails = try await mailController.listEmails(mailbox: mailbox, accountName: accountName, limit: limit)
+            let sinceDate = arguments["since_date"]?.stringValue
+            let beforeDate = arguments["before_date"]?.stringValue
+            let emails = try await mailController.listEmails(mailbox: mailbox, accountName: accountName, limit: limit, sinceDate: sinceDate, beforeDate: beforeDate)
             return formatJSON(emails)
 
         case "get_email":
@@ -965,6 +997,23 @@ class CheAppleMailMCPServer {
             let accountName = arguments["account_name"]?.stringValue
             let ids = idsArray.compactMap { $0.stringValue }
             return try await mailController.batchDeleteEmails(ids: ids, mailbox: mailbox, accountName: accountName)
+
+        // Cross-Account Tools
+        case "search_all_mailboxes":
+            guard let mailbox = arguments["mailbox"]?.stringValue else {
+                throw MailError.invalidParameter("mailbox is required")
+            }
+            let limit = arguments["limit"]?.intValue ?? 25
+            let emails = try await mailController.searchAllMailboxes(mailbox: mailbox, limit: limit)
+            return formatJSON(emails)
+
+        case "count_emails":
+            guard let mailbox = arguments["mailbox"]?.stringValue else {
+                throw MailError.invalidParameter("mailbox is required")
+            }
+            let accountName = arguments["account_name"]?.stringValue
+            let count = try await mailController.countEmails(mailbox: mailbox, accountName: accountName)
+            return formatJSON(["count": count])
 
         case "get_email_headers":
             guard let id = arguments["id"]?.stringValue,

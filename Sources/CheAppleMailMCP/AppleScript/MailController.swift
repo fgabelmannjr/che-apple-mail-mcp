@@ -1,5 +1,19 @@
 import Foundation
 
+// MARK: - Mailbox Cache
+
+/// Cached mailbox entry for durable mailbox-to-account mapping
+struct CachedMailbox: Codable {
+    let name: String
+    let accountName: String
+}
+
+/// Persistent mailbox cache stored in UserDefaults
+struct MailboxCache: Codable {
+    let lastUpdated: Date
+    let mailboxes: [CachedMailbox]
+}
+
 /// Controller for Apple Mail via AppleScript
 ///
 /// Uses Swift actor for thread safety. All public methods must make exactly
@@ -9,6 +23,51 @@ actor MailController {
     static let shared = MailController()
 
     private init() {}
+
+    // MARK: - Mailbox Cache (UserDefaults-backed)
+
+    private static let mailboxCacheKey = "com.che.applemail.mailboxCache"
+
+    /// Load cached mailbox data from UserDefaults, or nil if missing/corrupt
+    private func loadMailboxCache() -> MailboxCache? {
+        guard let data = UserDefaults.standard.data(forKey: Self.mailboxCacheKey),
+              let cache = try? JSONDecoder().decode(MailboxCache.self, from: data) else {
+            return nil
+        }
+        return cache
+    }
+
+    /// Save mailbox cache to UserDefaults
+    private func saveMailboxCache(_ cache: MailboxCache) {
+        if let data = try? JSONEncoder().encode(cache) {
+            UserDefaults.standard.set(data, forKey: Self.mailboxCacheKey)
+        }
+    }
+
+    /// Query all mailboxes from AppleScript and update the durable cache
+    private func refreshMailboxCache() throws -> MailboxCache {
+        let script = """
+        tell application "Mail"
+            set output to ""
+            repeat with acc in accounts
+                set accName to name of acc
+                repeat with mb in mailboxes of acc
+                    if output is not "" then set output to output & "<<<>>>"
+                    set output to output & accName & "|||" & (name of mb)
+                end repeat
+            end repeat
+            return output
+        end tell
+        """
+        let raw = try runScript(script)
+        let records = parseDelimitedRecords(raw, fieldCount: 2)
+        let cached = records.map { fields in
+            CachedMailbox(name: fields[1], accountName: fields[0])
+        }
+        let cache = MailboxCache(lastUpdated: Date(), mailboxes: cached)
+        saveMailboxCache(cache)
+        return cache
+    }
 
     // MARK: - AppleScript Execution (via osascript subprocess)
 
@@ -143,64 +202,46 @@ actor MailController {
 
     // MARK: - Mailbox Operations
 
-    /// List mailboxes for an account
-    func listMailboxes(accountName: String? = nil) throws -> [[String: Any]] {
-        let script: String
+    /// List mailboxes for an account.
+    /// When accountName is nil (all accounts), uses a durable UserDefaults cache.
+    /// Set refresh=true to force re-querying AppleScript and updating the cache.
+    func listMailboxes(accountName: String? = nil, refresh: Bool = false) throws -> [[String: Any]] {
         if let account = accountName {
-            script = """
-            tell application "Mail"
-                set mbList to {}
-                repeat with mb in mailboxes of account "\(escapeForAppleScript(account))"
-                    set mbInfo to {|name|:name of mb, |unreadCount|:unread count of mb, |messageCount|:count of messages of mb}
-                    set end of mbList to mbInfo
-                end repeat
-                return mbList
-            end tell
-            """
-        } else {
-            script = """
-            tell application "Mail"
-                set mbList to {}
-                repeat with acc in accounts
-                    repeat with mb in mailboxes of acc
-                        set mbInfo to {|name|:name of mb, |account|:name of acc, |unreadCount|:unread count of mb}
-                        set end of mbList to mbInfo
-                    end repeat
-                end repeat
-                return mbList
-            end tell
-            """
-        }
-
-        // Simplified: get mailbox names
-        let namesScript: String
-        if let account = accountName {
-            namesScript = """
+            // Single-account query: always live (fast enough), include account_name
+            let namesScript = """
             tell application "Mail"
                 get name of every mailbox of account "\(escapeForAppleScript(account))"
             end tell
             """
-        } else {
-            namesScript = """
-            tell application "Mail"
-                set allNames to {}
-                repeat with acc in accounts
-                    set accMailboxes to name of every mailbox of acc
-                    set allNames to allNames & accMailboxes
-                end repeat
-                return allNames
-            end tell
-            """
-        }
-
-        let names = try runScriptAsList(namesScript)
-
-        return names.map { name in
-            var info: [String: Any] = ["name": name]
-            if let account = accountName {
-                info["account"] = account
+            let names = try runScriptAsList(namesScript)
+            return names.map { name in
+                ["name": name, "account_name": account] as [String: Any]
             }
-            return info
+        } else {
+            // All-accounts query: use durable cache
+            let cache: MailboxCache
+            if !refresh, let existing = loadMailboxCache() {
+                cache = existing
+                let cacheAge = Date().timeIntervalSince(cache.lastUpdated)
+                return cache.mailboxes.map { mb in
+                    [
+                        "name": mb.name,
+                        "account_name": mb.accountName,
+                        "cached": true,
+                        "cache_age_seconds": Int(cacheAge)
+                    ] as [String: Any]
+                }
+            } else {
+                cache = try refreshMailboxCache()
+                return cache.mailboxes.map { mb in
+                    [
+                        "name": mb.name,
+                        "account_name": mb.accountName,
+                        "cached": false,
+                        "cache_age_seconds": 0
+                    ] as [String: Any]
+                }
+            }
         }
     }
 
@@ -250,7 +291,8 @@ actor MailController {
 
     /// List emails in a mailbox — single AppleScript call using vectorized property
     /// access + text item delimiters for fast structured output.
-    func listEmails(mailbox: String, accountName: String? = nil, limit: Int = 50) throws -> [[String: Any]] {
+    /// Optional sinceDate/beforeDate filters (format: "YYYY-MM-DD") applied in Swift.
+    func listEmails(mailbox: String, accountName: String? = nil, limit: Int = 50, sinceDate: String? = nil, beforeDate: String? = nil) throws -> [[String: Any]] {
         let mbRef = mailboxRef(mailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -265,25 +307,76 @@ actor MailController {
             set allIds to id of messages 1 thru actualLimit of mb
             set allSubjects to subject of messages 1 thru actualLimit of mb
             set allSenders to sender of messages 1 thru actualLimit of mb
+            set allDates to date received of messages 1 thru actualLimit of mb
             set output to ""
             repeat with i from 1 to actualLimit
                 if i > 1 then set output to output & "<<<>>>"
-                set output to output & (item i of allIds as string) & "|||" & item i of allSubjects & "|||" & item i of allSenders
+                set output to output & (item i of allIds as string) & "|||" & item i of allSubjects & "|||" & item i of allSenders & "|||" & (item i of allDates as string)
             end repeat
             return output
         end tell
         """
 
         let raw = try runScript(script)
-        let records = parseDelimitedRecords(raw, fieldCount: 3)
+        let records = parseDelimitedRecords(raw, fieldCount: 4)
 
-        return records.map { fields in
+        // Build date formatter for sinceDate/beforeDate filtering
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+
+        let since: Date? = sinceDate.flatMap { dateFormatter.date(from: $0) }
+        let before: Date? = beforeDate.flatMap { dateFormatter.date(from: $0) }
+
+        // Apple Mail returns localized date strings; try multiple formats
+        let parsers: [DateFormatter] = {
+            let formats = [
+                "EEE, dd MMM yyyy HH:mm:ss Z",
+                "EEEE, MMMM d, yyyy 'at' h:mm:ss a",
+                "yyyy-MM-dd HH:mm:ss Z",
+                "MM/dd/yyyy HH:mm:ss",
+                "dd/MM/yyyy HH:mm:ss",
+                "MMMM d, yyyy h:mm:ss a",
+                "d MMMM yyyy HH:mm:ss"
+            ]
+            return formats.map { fmt in
+                let df = DateFormatter()
+                df.dateFormat = fmt
+                df.locale = Locale(identifier: "en_US_POSIX")
+                return df
+            }
+        }()
+
+        func parseMailDate(_ s: String) -> Date? {
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            for parser in parsers {
+                if let d = parser.date(from: trimmed) { return d }
+            }
+            return nil
+        }
+
+        var results: [[String: Any]] = records.map { fields in
             [
                 "id": fields[0],
                 "subject": fields[1],
-                "sender": fields[2]
+                "sender": fields[2],
+                "date_received": fields[3]
             ] as [String: Any]
         }
+
+        // Apply date filters if provided
+        if since != nil || before != nil {
+            results = results.filter { email in
+                guard let dateStr = email["date_received"] as? String,
+                      let emailDate = parseMailDate(dateStr) else {
+                    return true // keep emails with unparseable dates
+                }
+                if let since = since, emailDate < since { return false }
+                if let before = before, emailDate >= before { return false }
+                return true
+            }
+        }
+
+        return results
     }
 
     /// Get email content by ID (single AppleScript call for metadata + content)
@@ -375,23 +468,25 @@ actor MailController {
             set idList to {\(idsLiteral)}
             set output to ""
             repeat with targetId in idList
-                set msg to (first message of mb whose id is targetId)
-                set msgSubject to subject of msg
-                set msgSender to sender of msg
-                set msgDate to date received of msg as string
-                set msgContent to content of msg
-                set toRecips to ""
-                repeat with r in (to recipients of msg)
-                    if toRecips is not "" then set toRecips to toRecips & ", "
-                    set toRecips to toRecips & (address of r)
-                end repeat
-                set ccRecips to ""
-                repeat with r in (cc recipients of msg)
-                    if ccRecips is not "" then set ccRecips to ccRecips & ", "
-                    set ccRecips to ccRecips & (address of r)
-                end repeat
-                if output is not "" then set output to output & "<<<REC>>>"
-                set output to output & (targetId as string) & "<<<F>>>" & msgSubject & "<<<F>>>" & msgSender & "<<<F>>>" & msgDate & "<<<F>>>" & toRecips & "<<<F>>>" & ccRecips & "<<<F>>>" & msgContent
+                try
+                    set msg to (first message of mb whose id is targetId)
+                    set msgSubject to subject of msg
+                    set msgSender to sender of msg
+                    set msgDate to date received of msg as string
+                    set msgContent to content of msg
+                    set toRecips to ""
+                    repeat with r in (to recipients of msg)
+                        if toRecips is not "" then set toRecips to toRecips & ", "
+                        set toRecips to toRecips & (address of r)
+                    end repeat
+                    set ccRecips to ""
+                    repeat with r in (cc recipients of msg)
+                        if ccRecips is not "" then set ccRecips to ccRecips & ", "
+                        set ccRecips to ccRecips & (address of r)
+                    end repeat
+                    if output is not "" then set output to output & "<<<REC>>>"
+                    set output to output & (targetId as string) & "<<<F>>>" & msgSubject & "<<<F>>>" & msgSender & "<<<F>>>" & msgDate & "<<<F>>>" & toRecips & "<<<F>>>" & ccRecips & "<<<F>>>" & msgContent
+                end try
             end repeat
             return output
         end tell
@@ -1460,6 +1555,163 @@ actor MailController {
         end tell
         """
         return try runScript(script)
+    }
+
+    // MARK: - Search All Mailboxes
+
+    /// Search a specific mailbox name across ALL accounts in one call.
+    /// Uses parallel osascript execution for concurrency.
+    func searchAllMailboxes(mailbox: String, limit: Int = 25) async throws -> [[String: Any]] {
+        // First get the list of account names
+        let accountsScript = """
+        tell application "Mail"
+            get name of every account
+        end tell
+        """
+        let accountNames = try runScriptAsList(accountsScript)
+        guard !accountNames.isEmpty else { return [] }
+
+        // Build one script per account
+        let escapedMailbox = escapeForAppleScript(mailbox)
+        let scripts = accountNames.map { acctName -> String in
+            let escapedAcct = escapeForAppleScript(acctName)
+            return """
+            tell application "Mail"
+                try
+                    set mb to mailbox "\(escapedMailbox)" of account "\(escapedAcct)"
+                    set msgCount to count of messages of mb
+                    if msgCount = 0 then return ""
+                    if \(limit) < msgCount then
+                        set actualLimit to \(limit)
+                    else
+                        set actualLimit to msgCount
+                    end if
+                    set allIds to id of messages 1 thru actualLimit of mb
+                    set allSubjects to subject of messages 1 thru actualLimit of mb
+                    set allSenders to sender of messages 1 thru actualLimit of mb
+                    set allDates to date received of messages 1 thru actualLimit of mb
+                    set output to ""
+                    repeat with i from 1 to actualLimit
+                        if i > 1 then set output to output & "<<<>>>"
+                        set output to output & "\(escapedAcct)" & "|||" & (item i of allIds as string) & "|||" & item i of allSubjects & "|||" & item i of allSenders & "|||" & (item i of allDates as string)
+                    end repeat
+                    return output
+                on error
+                    return ""
+                end try
+            end tell
+            """
+        }
+
+        // Run all account scripts concurrently
+        let rawResults = try await runScriptsParallel(scripts)
+
+        // Parse and merge results
+        var allEmails: [[String: Any]] = []
+        for raw in rawResults {
+            let records = parseDelimitedRecords(raw, fieldCount: 5)
+            for fields in records {
+                allEmails.append([
+                    "account_name": fields[0],
+                    "id": fields[1],
+                    "subject": fields[2],
+                    "sender": fields[3],
+                    "date_received": fields[4]
+                ] as [String: Any])
+            }
+        }
+
+        return allEmails
+    }
+
+    // MARK: - Count Emails
+
+    /// Get the message count for a mailbox (lightweight, no message data)
+    func countEmails(mailbox: String, accountName: String? = nil) throws -> Int {
+        let mbRef = mailboxRef(mailbox, account: accountName)
+        let script = """
+        tell application "Mail"
+            get count of messages of \(mbRef)
+        end tell
+        """
+        let result = try runScript(script)
+        return Int(result) ?? 0
+    }
+
+    // MARK: - Parallel Script Execution
+
+    /// Execute AppleScript without actor serialization. Safe for concurrent use
+    /// since each call creates its own Process instance with independent pipes.
+    nonisolated func runScriptDetached(_ source: String) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                    process.arguments = ["-"]
+
+                    let inputPipe = Pipe()
+                    let outputPipe = Pipe()
+                    let errorPipe = Pipe()
+
+                    process.standardInput = inputPipe
+                    process.standardOutput = outputPipe
+                    process.standardError = errorPipe
+
+                    try process.run()
+
+                    inputPipe.fileHandleForWriting.write(Data(source.utf8))
+                    inputPipe.fileHandleForWriting.closeFile()
+
+                    var outputData = Data()
+                    var errorData = Data()
+                    let group = DispatchGroup()
+
+                    group.enter()
+                    DispatchQueue.global().async {
+                        outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+                        group.leave()
+                    }
+                    group.enter()
+                    DispatchQueue.global().async {
+                        errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                        group.leave()
+                    }
+                    group.wait()
+                    process.waitUntilExit()
+
+                    if process.terminationStatus != 0 {
+                        let msg = String(data: errorData, encoding: .utf8)?
+                            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+                        continuation.resume(throwing: MailError.scriptFailed(message: msg, code: Int(process.terminationStatus)))
+                        return
+                    }
+
+                    var output = String(data: outputData, encoding: .utf8) ?? ""
+                    if output.hasSuffix("\n") { output = String(output.dropLast()) }
+                    continuation.resume(returning: output)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Run multiple AppleScripts concurrently, returning results in order.
+    nonisolated func runScriptsParallel(_ scripts: [String]) async throws -> [String] {
+        try await withThrowingTaskGroup(of: (Int, String).self) { group in
+            for (index, script) in scripts.enumerated() {
+                group.addTask {
+                    let result = try await self.runScriptDetached(script)
+                    return (index, result)
+                }
+            }
+            var results = Array(repeating: "", count: scripts.count)
+            for try await (index, result) in group {
+                results[index] = result
+            }
+            return results
+        }
     }
 
     // MARK: - Helpers
