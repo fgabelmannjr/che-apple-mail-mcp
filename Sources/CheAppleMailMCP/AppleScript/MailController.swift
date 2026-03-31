@@ -221,46 +221,40 @@ actor MailController {
         }
     }
 
-    /// List emails in a mailbox (single AppleScript call — returns id, subject, sender, date, read status)
-    func listEmails(mailbox: String, accountName: String, limit: Int = 50) throws -> [[String: Any]] {
-        let script = """
+    /// Helper to build mailbox-scoped vectorized property fetch script
+    private func vectorizedFetchScript(property: String, mailbox: String, accountName: String, limit: Int) -> String {
+        """
         tell application "Mail"
             set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
             set msgCount to count of messages of mb
-            if msgCount = 0 then return ""
+            if msgCount = 0 then return {}
             if \(limit) < msgCount then
                 set actualLimit to \(limit)
             else
                 set actualLimit to msgCount
             end if
-            set msgs to messages 1 thru actualLimit of mb
-            set output to ""
-            repeat with i from 1 to actualLimit
-                set msg to item i of msgs
-                set msgId to id of msg
-                set msgSubject to subject of msg
-                set msgSender to sender of msg
-                set msgDate to date received of msg as string
-                set msgRead to read status of msg
-                if i > 1 then set output to output & "<<<>>>"
-                set output to output & (msgId as string) & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDate & "|||" & (msgRead as string)
-            end repeat
-            return output
+            get \(property) of messages 1 thru actualLimit of mb
         end tell
         """
+    }
 
-        let raw = try runScript(script)
-        let records = parseDelimitedRecords(raw, fieldCount: 5)
+    /// List emails in a mailbox using vectorized property access (3 fast Apple Events)
+    func listEmails(mailbox: String, accountName: String, limit: Int = 50) throws -> [[String: Any]] {
+        let ids = try runScriptAsList(vectorizedFetchScript(property: "id", mailbox: mailbox, accountName: accountName, limit: limit))
+        guard !ids.isEmpty else { return [] }
 
-        return records.map { fields in
-            [
-                "id": fields[0],
-                "subject": fields[1],
-                "sender": fields[2],
-                "date_received": fields[3],
-                "read": fields[4] == "true"
-            ] as [String: Any]
+        let subjects = try runScriptAsList(vectorizedFetchScript(property: "subject", mailbox: mailbox, accountName: accountName, limit: limit))
+        let senders = try runScriptAsList(vectorizedFetchScript(property: "sender", mailbox: mailbox, accountName: accountName, limit: limit))
+
+        var emails: [[String: Any]] = []
+        for i in 0..<min(ids.count, subjects.count, senders.count) {
+            emails.append([
+                "id": ids[i],
+                "subject": subjects[i],
+                "sender": senders[i]
+            ])
         }
+        return emails
     }
 
     /// Get email content by ID (single AppleScript call for metadata + content)
