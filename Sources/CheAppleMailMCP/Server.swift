@@ -441,6 +441,49 @@ class CheAppleMailMCPServer {
                     "required": .array([.string("id"), .string("mailbox"), .string("account_name"), .string("is_junk")])
                 ])
             ),
+
+            // Batch Tools (performance-optimized)
+            Tool(
+                name: "batch_get_emails",
+                description: "Get multiple emails by ID in a single call. Much faster than calling get_email repeatedly. Returns text content for each email.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "ids": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Array of email IDs to fetch")]),
+                        "mailbox": .object(["type": .string("string"), "description": .string("Mailbox name")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("The mail account")])
+                    ]),
+                    "required": .array([.string("ids"), .string("mailbox"), .string("account_name")])
+                ])
+            ),
+            Tool(
+                name: "batch_move_emails",
+                description: "Move multiple emails to another mailbox in a single call. Much faster than calling move_email repeatedly.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "ids": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Array of email IDs to move")]),
+                        "from_mailbox": .object(["type": .string("string"), "description": .string("Source mailbox")]),
+                        "to_mailbox": .object(["type": .string("string"), "description": .string("Destination mailbox")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("The mail account")])
+                    ]),
+                    "required": .array([.string("ids"), .string("from_mailbox"), .string("to_mailbox"), .string("account_name")])
+                ])
+            ),
+            Tool(
+                name: "batch_delete_emails",
+                description: "Delete multiple emails in a single call. Much faster than calling delete_email repeatedly.",
+                inputSchema: .object([
+                    "type": .string("object"),
+                    "properties": .object([
+                        "ids": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Array of email IDs to delete")]),
+                        "mailbox": .object(["type": .string("string"), "description": .string("Mailbox name")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("The mail account")])
+                    ]),
+                    "required": .array([.string("ids"), .string("mailbox"), .string("account_name")])
+                ])
+            ),
+
             Tool(
                 name: "get_email_headers",
                 description: "Get all headers of an email",
@@ -889,6 +932,36 @@ class CheAppleMailMCPServer {
                 throw MailError.invalidParameter("id, mailbox, account_name, and is_junk are required")
             }
             return try await mailController.markAsJunk(id: id, mailbox: mailbox, accountName: accountName, isJunk: isJunk)
+
+        // Batch Tools
+        case "batch_get_emails":
+            guard let idsArray = arguments["ids"]?.arrayValue,
+                  let mailbox = arguments["mailbox"]?.stringValue,
+                  let accountName = arguments["account_name"]?.stringValue else {
+                throw MailError.invalidParameter("ids, mailbox, and account_name are required")
+            }
+            let ids = idsArray.compactMap { $0.stringValue }
+            let emails = try await mailController.batchGetEmails(ids: ids, mailbox: mailbox, accountName: accountName)
+            return formatJSON(emails)
+
+        case "batch_move_emails":
+            guard let idsArray = arguments["ids"]?.arrayValue,
+                  let fromMailbox = arguments["from_mailbox"]?.stringValue,
+                  let toMailbox = arguments["to_mailbox"]?.stringValue,
+                  let accountName = arguments["account_name"]?.stringValue else {
+                throw MailError.invalidParameter("ids, from_mailbox, to_mailbox, and account_name are required")
+            }
+            let ids = idsArray.compactMap { $0.stringValue }
+            return try await mailController.batchMoveEmails(ids: ids, fromMailbox: fromMailbox, toMailbox: toMailbox, accountName: accountName)
+
+        case "batch_delete_emails":
+            guard let idsArray = arguments["ids"]?.arrayValue,
+                  let mailbox = arguments["mailbox"]?.stringValue,
+                  let accountName = arguments["account_name"]?.stringValue else {
+                throw MailError.invalidParameter("ids, mailbox, and account_name are required")
+            }
+            let ids = idsArray.compactMap { $0.stringValue }
+            return try await mailController.batchDeleteEmails(ids: ids, mailbox: mailbox, accountName: accountName)
 
         case "get_email_headers":
             guard let id = arguments["id"]?.stringValue,

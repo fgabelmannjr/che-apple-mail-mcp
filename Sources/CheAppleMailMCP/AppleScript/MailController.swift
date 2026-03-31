@@ -201,134 +201,128 @@ actor MailController {
 
     // MARK: - Email Operations
 
-    /// List emails in a mailbox
+    // MARK: - Delimiter-based parsing helpers
+
+    /// Field delimiter within a record
+    private static let fieldDelimiter = "|||"
+    /// Record delimiter between records
+    private static let recordDelimiter = "<<<>>>"
+
+    /// Parse a delimiter-separated string into an array of field arrays
+    private func parseDelimitedRecords(_ raw: String, fieldCount: Int) -> [[String]] {
+        guard !raw.isEmpty else { return [] }
+        let records = raw.components(separatedBy: Self.recordDelimiter)
+        return records.compactMap { record in
+            let trimmed = record.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let fields = trimmed.components(separatedBy: Self.fieldDelimiter)
+            guard fields.count >= fieldCount else { return nil }
+            return fields
+        }
+    }
+
+    /// List emails in a mailbox (single AppleScript call — returns id, subject, sender, date, read status)
     func listEmails(mailbox: String, accountName: String, limit: Int = 50) throws -> [[String: Any]] {
         let script = """
         tell application "Mail"
-            set msgs to messages 1 thru \(limit) of mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
-            set msgList to {}
-            repeat with msg in msgs
-                set msgInfo to {|id|:id of msg, |subject|:subject of msg, |sender|:sender of msg, |dateReceived|:date received of msg as string, |read|:read status of msg}
-                set end of msgList to msgInfo
+            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
+            set msgCount to count of messages of mb
+            if msgCount = 0 then return ""
+            if \(limit) < msgCount then
+                set actualLimit to \(limit)
+            else
+                set actualLimit to msgCount
+            end if
+            set msgs to messages 1 thru actualLimit of mb
+            set output to ""
+            repeat with i from 1 to actualLimit
+                set msg to item i of msgs
+                set msgId to id of msg
+                set msgSubject to subject of msg
+                set msgSender to sender of msg
+                set msgDate to date received of msg as string
+                set msgRead to read status of msg
+                if i > 1 then set output to output & "<<<>>>"
+                set output to output & (msgId as string) & "|||" & msgSubject & "|||" & msgSender & "|||" & msgDate & "|||" & (msgRead as string)
             end repeat
-            return msgList
+            return output
         end tell
         """
 
-        // Simplified approach: get basic info (clamp limit to actual message count)
-        let subjectsScript = """
-        tell application "Mail"
-            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
-            set msgCount to count of messages of mb
-            if msgCount = 0 then return {}
-            if \(limit) < msgCount then
-                set actualLimit to \(limit)
-            else
-                set actualLimit to msgCount
-            end if
-            get subject of messages 1 thru actualLimit of mb
-        end tell
-        """
+        let raw = try runScript(script)
+        let records = parseDelimitedRecords(raw, fieldCount: 5)
 
-        let sendersScript = """
-        tell application "Mail"
-            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
-            set msgCount to count of messages of mb
-            if msgCount = 0 then return {}
-            if \(limit) < msgCount then
-                set actualLimit to \(limit)
-            else
-                set actualLimit to msgCount
-            end if
-            get sender of messages 1 thru actualLimit of mb
-        end tell
-        """
-
-        let idsScript = """
-        tell application "Mail"
-            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
-            set msgCount to count of messages of mb
-            if msgCount = 0 then return {}
-            if \(limit) < msgCount then
-                set actualLimit to \(limit)
-            else
-                set actualLimit to msgCount
-            end if
-            get id of messages 1 thru actualLimit of mb
-        end tell
-        """
-
-        let subjects = try runScriptAsList(subjectsScript)
-        let senders = try runScriptAsList(sendersScript)
-        let ids = try runScriptAsList(idsScript)
-
-        var emails: [[String: Any]] = []
-        for i in 0..<min(subjects.count, senders.count, ids.count) {
-            emails.append([
-                "id": ids[i],
-                "subject": subjects[i],
-                "sender": senders[i]
-            ])
+        return records.map { fields in
+            [
+                "id": fields[0],
+                "subject": fields[1],
+                "sender": fields[2],
+                "date_received": fields[3],
+                "read": fields[4] == "true"
+            ] as [String: Any]
         }
-
-        return emails
     }
 
-    /// Get email content by ID
+    /// Get email content by ID (single AppleScript call for metadata + content)
     /// - format: "html" (default) returns HTML body with links preserved;
     ///           "text" returns plain text content;
     ///           "source" returns full MIME source
     func getEmail(id: String, mailbox: String, accountName: String, format: String = "html") throws -> [String: Any] {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
 
-        let subjectScript = """
-        tell application "Mail"
-            get subject of \(ref)
-        end tell
-        """
-
-        let senderScript = """
-        tell application "Mail"
-            get sender of \(ref)
-        end tell
-        """
-
-        let dateScript = """
-        tell application "Mail"
-            get date received of \(ref) as string
-        end tell
-        """
-
-        let subject = try runScript(subjectScript)
-        let sender = try runScript(senderScript)
-        let dateReceived = try runScript(dateScript)
-
-        let content: String
+        // Fetch metadata + content in a single AppleScript call
+        let contentProp: String
         switch format {
         case "text":
-            let contentScript = """
-            tell application "Mail"
-                get content of \(ref)
-            end tell
-            """
-            content = try runScript(contentScript)
-
+            contentProp = "content of msg"
         case "source":
-            let sourceScript = """
-            tell application "Mail"
-                get source of \(ref)
-            end tell
-            """
-            content = try runScript(sourceScript)
+            contentProp = "source of msg"
+        default: // "html" — fetch source, extract HTML in Swift
+            contentProp = "source of msg"
+        }
 
-        default: // "html"
-            let sourceScript = """
-            tell application "Mail"
-                get source of \(ref)
-            end tell
-            """
-            let rawSource = try runScript(sourceScript)
-            content = extractHTMLBody(from: rawSource)
+        let script = """
+        tell application "Mail"
+            set msg to \(ref)
+            set msgSubject to subject of msg
+            set msgSender to sender of msg
+            set msgDate to date received of msg as string
+            set msgRead to read status of msg as string
+            set msgContent to \(contentProp)
+            set toRecips to ""
+            repeat with r in (to recipients of msg)
+                if toRecips is not "" then set toRecips to toRecips & ", "
+                set toRecips to toRecips & (address of r) & " (" & (name of r) & ")"
+            end repeat
+            set ccRecips to ""
+            repeat with r in (cc recipients of msg)
+                if ccRecips is not "" then set ccRecips to ccRecips & ", "
+                set ccRecips to ccRecips & (address of r) & " (" & (name of r) & ")"
+            end repeat
+            return msgSubject & "<<<FIELD>>>" & msgSender & "<<<FIELD>>>" & msgDate & "<<<FIELD>>>" & msgRead & "<<<FIELD>>>" & toRecips & "<<<FIELD>>>" & ccRecips & "<<<FIELD>>>" & msgContent
+        end tell
+        """
+
+        let raw = try runScript(script)
+        let parts = raw.components(separatedBy: "<<<FIELD>>>")
+
+        guard parts.count >= 7 else {
+            throw MailError.scriptFailed(message: "Unexpected response format from getEmail", code: -1)
+        }
+
+        let subject = parts[0]
+        let sender = parts[1]
+        let dateReceived = parts[2]
+        let readStatus = parts[3]
+        let toRecipients = parts[4]
+        let ccRecipients = parts[5]
+        let rawContent = parts[6...].joined(separator: "<<<FIELD>>>") // content may contain the delimiter
+
+        let content: String
+        if format == "html" {
+            content = extractHTMLBody(from: rawContent)
+        } else {
+            content = rawContent
         }
 
         return [
@@ -336,9 +330,117 @@ actor MailController {
             "subject": subject,
             "sender": sender,
             "date_received": dateReceived,
+            "read": readStatus == "true",
+            "to": toRecipients,
+            "cc": ccRecipients,
             "format": format,
             "content": content
         ]
+    }
+
+    /// Batch get multiple emails by ID in a single AppleScript call
+    /// Returns text content for each email (most token-efficient for LLM consumption)
+    func batchGetEmails(ids: [String], mailbox: String, accountName: String) throws -> [[String: Any]] {
+        guard !ids.isEmpty else { return [] }
+
+        // Build AppleScript that fetches all emails in one tell block
+        let idsLiteral = ids.joined(separator: ", ")
+        let script = """
+        tell application "Mail"
+            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
+            set idList to {\(idsLiteral)}
+            set output to ""
+            repeat with targetId in idList
+                set msg to (first message of mb whose id is targetId)
+                set msgSubject to subject of msg
+                set msgSender to sender of msg
+                set msgDate to date received of msg as string
+                set msgContent to content of msg
+                set toRecips to ""
+                repeat with r in (to recipients of msg)
+                    if toRecips is not "" then set toRecips to toRecips & ", "
+                    set toRecips to toRecips & (address of r)
+                end repeat
+                set ccRecips to ""
+                repeat with r in (cc recipients of msg)
+                    if ccRecips is not "" then set ccRecips to ccRecips & ", "
+                    set ccRecips to ccRecips & (address of r)
+                end repeat
+                if output is not "" then set output to output & "<<<REC>>>"
+                set output to output & (targetId as string) & "<<<F>>>" & msgSubject & "<<<F>>>" & msgSender & "<<<F>>>" & msgDate & "<<<F>>>" & toRecips & "<<<F>>>" & ccRecips & "<<<F>>>" & msgContent
+            end repeat
+            return output
+        end tell
+        """
+
+        let raw = try runScript(script)
+        guard !raw.isEmpty else { return [] }
+
+        let records = raw.components(separatedBy: "<<<REC>>>")
+        return records.compactMap { record in
+            let trimmed = record.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            let parts = trimmed.components(separatedBy: "<<<F>>>")
+            guard parts.count >= 7 else { return nil }
+            return [
+                "id": parts[0],
+                "subject": parts[1],
+                "sender": parts[2],
+                "date_received": parts[3],
+                "to": parts[4],
+                "cc": parts[5],
+                "content": parts[6...].joined(separator: "<<<F>>>") // content may contain delimiter
+            ] as [String: Any]
+        }
+    }
+
+    /// Batch move multiple emails to a target mailbox in a single AppleScript call
+    func batchMoveEmails(ids: [String], fromMailbox: String, toMailbox: String, accountName: String) throws -> String {
+        guard !ids.isEmpty else { return "No emails to move" }
+
+        let idsLiteral = ids.joined(separator: ", ")
+        let script = """
+        tell application "Mail"
+            set mb to mailbox "\(escapeForAppleScript(fromMailbox))" of account "\(escapeForAppleScript(accountName))"
+            set targetMb to mailbox "\(escapeForAppleScript(toMailbox))" of account "\(escapeForAppleScript(accountName))"
+            set idList to {\(idsLiteral)}
+            set movedCount to 0
+            repeat with targetId in idList
+                try
+                    set msg to (first message of mb whose id is targetId)
+                    move msg to targetMb
+                    set movedCount to movedCount + 1
+                end try
+            end repeat
+            return "Moved " & (movedCount as string) & " of " & ((count of idList) as string) & " emails to " & "\(escapeForAppleScript(toMailbox))"
+        end tell
+        """
+
+        return try runScript(script)
+    }
+
+    /// Batch delete multiple emails in a single AppleScript call
+    func batchDeleteEmails(ids: [String], mailbox: String, accountName: String) throws -> String {
+        guard !ids.isEmpty else { return "No emails to delete" }
+
+        let idsLiteral = ids.joined(separator: ", ")
+        let script = """
+        tell application "Mail"
+            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
+            set idList to {\(idsLiteral)}
+            set deletedCount to 0
+            repeat with targetId in idList
+                try
+                    set msg to (first message of mb whose id is targetId)
+                    delete msg
+                    set deletedCount to deletedCount + 1
+                end try
+            end repeat
+            return "Deleted " & (deletedCount as string) & " of " & ((count of idList) as string) & " emails"
+        end tell
+        """
+
+        return try runScript(script)
     }
 
     /// Extract HTML body from MIME source, falling back to plain text content
