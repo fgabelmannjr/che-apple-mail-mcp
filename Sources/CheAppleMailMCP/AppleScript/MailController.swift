@@ -1559,69 +1559,54 @@ actor MailController {
 
     // MARK: - Search All Mailboxes
 
-    /// Search a specific mailbox name across ALL accounts in one call.
-    /// Uses parallel osascript execution for concurrency.
-    func searchAllMailboxes(mailbox: String, limit: Int = 25) async throws -> [[String: Any]] {
-        // First get the list of account names
-        let accountsScript = """
+    /// Search a specific mailbox name across ALL accounts in a single osascript call.
+    /// Uses one AppleScript with per-account try/end try — avoids spawning multiple
+    /// osascript processes, which deadlocks because Apple Mail serializes Apple Events
+    /// internally (8 concurrent processes = 8 threads waiting in line, zero parallelism,
+    /// plus cooperative thread pool starvation from TaskGroup bookkeeping).
+    func searchAllMailboxes(mailbox: String, limit: Int = 25) throws -> [[String: Any]] {
+        let escapedMailbox = escapeForAppleScript(mailbox)
+        let script = """
         tell application "Mail"
-            get name of every account
+            set output to ""
+            repeat with acc in accounts
+                set accName to name of acc
+                try
+                    set mb to mailbox "\(escapedMailbox)" of acc
+                    set msgCount to count of messages of mb
+                    if msgCount > 0 then
+                        if \(limit) < msgCount then
+                            set actualLimit to \(limit)
+                        else
+                            set actualLimit to msgCount
+                        end if
+                        set allIds to id of messages 1 thru actualLimit of mb
+                        set allSubjects to subject of messages 1 thru actualLimit of mb
+                        set allSenders to sender of messages 1 thru actualLimit of mb
+                        set allDates to date received of messages 1 thru actualLimit of mb
+                        repeat with i from 1 to actualLimit
+                            if output is not "" then set output to output & "<<<>>>"
+                            set output to output & accName & "|||" & (item i of allIds as string) & "|||" & item i of allSubjects & "|||" & item i of allSenders & "|||" & (item i of allDates as string)
+                        end repeat
+                    end if
+                end try
+            end repeat
+            return output
         end tell
         """
-        let accountNames = try runScriptAsList(accountsScript)
-        guard !accountNames.isEmpty else { return [] }
 
-        // Build one script per account
-        let escapedMailbox = escapeForAppleScript(mailbox)
-        let scripts = accountNames.map { acctName -> String in
-            let escapedAcct = escapeForAppleScript(acctName)
-            return """
-            tell application "Mail"
-                try
-                    set mb to mailbox "\(escapedMailbox)" of account "\(escapedAcct)"
-                    set msgCount to count of messages of mb
-                    if msgCount = 0 then return ""
-                    if \(limit) < msgCount then
-                        set actualLimit to \(limit)
-                    else
-                        set actualLimit to msgCount
-                    end if
-                    set allIds to id of messages 1 thru actualLimit of mb
-                    set allSubjects to subject of messages 1 thru actualLimit of mb
-                    set allSenders to sender of messages 1 thru actualLimit of mb
-                    set allDates to date received of messages 1 thru actualLimit of mb
-                    set output to ""
-                    repeat with i from 1 to actualLimit
-                        if i > 1 then set output to output & "<<<>>>"
-                        set output to output & "\(escapedAcct)" & "|||" & (item i of allIds as string) & "|||" & item i of allSubjects & "|||" & item i of allSenders & "|||" & (item i of allDates as string)
-                    end repeat
-                    return output
-                on error
-                    return ""
-                end try
-            end tell
-            """
+        let raw = try runScript(script)
+        let records = parseDelimitedRecords(raw, fieldCount: 5)
+
+        return records.map { fields in
+            [
+                "account_name": fields[0],
+                "id": fields[1],
+                "subject": fields[2],
+                "sender": fields[3],
+                "date_received": fields[4]
+            ] as [String: Any]
         }
-
-        // Run all account scripts concurrently
-        let rawResults = try await runScriptsParallel(scripts)
-
-        // Parse and merge results
-        var allEmails: [[String: Any]] = []
-        for raw in rawResults {
-            let records = parseDelimitedRecords(raw, fieldCount: 5)
-            for fields in records {
-                allEmails.append([
-                    "account_name": fields[0],
-                    "id": fields[1],
-                    "subject": fields[2],
-                    "sender": fields[3],
-                    "date_received": fields[4]
-                ] as [String: Any])
-            }
-        }
-
-        return allEmails
     }
 
     // MARK: - Count Emails
