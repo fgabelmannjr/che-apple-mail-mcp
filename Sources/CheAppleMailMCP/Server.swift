@@ -645,10 +645,13 @@ class CheAppleMailMCPServer {
     // MARK: - Tool Call Handler
 
     private func handleToolCall(name: String, arguments: [String: Value]) async -> CallTool.Result {
+        FileHandle.standardError.write(Data("[MCP] handleToolCall: \(name)\n".utf8))
         do {
             let result = try await executeToolCall(name: name, arguments: arguments)
+            FileHandle.standardError.write(Data("[MCP] handleToolCall OK: \(name) (\(result.prefix(80))...)\n".utf8))
             return CallTool.Result(content: [.text(result)])
         } catch {
+            FileHandle.standardError.write(Data("[MCP] handleToolCall ERROR: \(name): \(error)\n".utf8))
             return CallTool.Result(content: [.text("Error: \(error.localizedDescription)")], isError: true)
         }
     }

@@ -2,84 +2,89 @@ import Foundation
 
 /// Controller for Apple Mail via AppleScript
 ///
-/// AppleScript calls are dispatched to a dedicated serial queue to avoid
-/// blocking Swift's cooperative thread pool (which the MCP StdioTransport
-/// needs for stdin/stdout I/O).
+/// Uses Swift actor for thread safety. All public methods must make exactly
+/// ONE call to runScript/runScriptAsList to avoid actor re-acquisition
+/// deadlocks between sequential await points.
 actor MailController {
     static let shared = MailController()
 
-    /// Dedicated queue for blocking NSAppleScript calls — keeps the
-    /// cooperative thread pool free for MCP transport I/O.
-    private static let scriptQueue = DispatchQueue(
-        label: "com.che.applescript",
-        qos: .userInitiated
-    )
-
     private init() {}
 
-    // MARK: - AppleScript Execution
+    // MARK: - AppleScript Execution (via osascript subprocess)
 
-    /// Execute AppleScript and return result (non-blocking to cooperative pool)
-    func runScript(_ source: String) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            Self.scriptQueue.async {
-                var error: NSDictionary?
-                guard let script = NSAppleScript(source: source) else {
-                    continuation.resume(throwing: MailError.scriptCreationFailed)
-                    return
-                }
+    /// Execute AppleScript via osascript subprocess and return result.
+    ///
+    /// Uses Process (fork/exec) instead of NSAppleScript because
+    /// NSAppleScript.executeAndReturnError() relies on Mach port IPC
+    /// that requires RunLoop infrastructure. Swift's cooperative thread
+    /// pool (used by actors and the MCP framework's StdioTransport) has
+    /// no RunLoop, causing NSAppleScript to hang indefinitely for any
+    /// script that takes more than a few milliseconds.
+    ///
+    /// Process-based osascript uses POSIX I/O (pipes + waitpid) which
+    /// works correctly on any thread.
+    func runScript(_ source: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-"]  // Read script from stdin (no arg length limits)
 
-                let result = script.executeAndReturnError(&error)
+        let inputPipe = Pipe()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
 
-                if let error = error {
-                    let message = error["NSAppleScriptErrorMessage"] as? String ?? "Unknown AppleScript error"
-                    let code = error["NSAppleScriptErrorNumber"] as? Int ?? -1
-                    continuation.resume(throwing: MailError.scriptFailed(message: message, code: code))
-                } else {
-                    continuation.resume(returning: result.stringValue ?? "")
-                }
-            }
+        process.standardInput = inputPipe
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        try process.run()
+
+        // Feed the script via stdin and close to signal EOF
+        inputPipe.fileHandleForWriting.write(Data(source.utf8))
+        inputPipe.fileHandleForWriting.closeFile()
+
+        // Read both pipes concurrently to prevent pipe-buffer deadlock
+        // (if stderr fills its 64KB buffer while we're blocked reading stdout)
+        var outputData = Data()
+        var errorData = Data()
+        let group = DispatchGroup()
+
+        group.enter()
+        DispatchQueue.global().async {
+            outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
         }
+        group.enter()
+        DispatchQueue.global().async {
+            errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+            group.leave()
+        }
+        group.wait()
+        process.waitUntilExit()
+
+        if process.terminationStatus != 0 {
+            let msg = String(data: errorData, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+            throw MailError.scriptFailed(message: msg, code: Int(process.terminationStatus))
+        }
+
+        var output = String(data: outputData, encoding: .utf8) ?? ""
+        // osascript appends a trailing newline to output
+        if output.hasSuffix("\n") { output = String(output.dropLast()) }
+        return output
     }
 
-    /// Execute AppleScript and return result as list (non-blocking to cooperative pool)
-    func runScriptAsList(_ source: String) async throws -> [String] {
-        try await withCheckedThrowingContinuation { continuation in
-            Self.scriptQueue.async {
-                var error: NSDictionary?
-                guard let script = NSAppleScript(source: source) else {
-                    continuation.resume(throwing: MailError.scriptCreationFailed)
-                    return
-                }
-
-                let result = script.executeAndReturnError(&error)
-
-                if let error = error {
-                    let message = error["NSAppleScriptErrorMessage"] as? String ?? "Unknown AppleScript error"
-                    let code = error["NSAppleScriptErrorNumber"] as? Int ?? -1
-                    continuation.resume(throwing: MailError.scriptFailed(message: message, code: code))
-                    return
-                }
-
-                // Parse list result
-                var items: [String] = []
-                let count = result.numberOfItems
-                if count > 0 {
-                    for i in 1...count {
-                        if let item = result.atIndex(i)?.stringValue {
-                            items.append(item)
-                        }
-                    }
-                }
-                continuation.resume(returning: items)
-            }
-        }
+    /// Execute AppleScript via osascript and return result as list.
+    /// Parses osascript's comma-separated list output format.
+    func runScriptAsList(_ source: String) throws -> [String] {
+        let raw = try runScript(source)
+        guard !raw.isEmpty else { return [] }
+        return raw.components(separatedBy: ", ")
     }
 
     // MARK: - Account Operations
 
     /// List all mail accounts
-    func listAccounts() async throws -> [[String: Any]] {
+    func listAccounts() throws -> [[String: Any]] {
         let script = """
         tell application "Mail"
             set accountList to {}
@@ -98,7 +103,7 @@ actor MailController {
         end tell
         """
 
-        let names = try await runScriptAsList(namesScript)
+        let names = try runScriptAsList(namesScript)
 
         return names.map { name in
             ["name": name]
@@ -106,7 +111,7 @@ actor MailController {
     }
 
     /// Get account details
-    func getAccountInfo(accountName: String) async throws -> [String: Any] {
+    func getAccountInfo(accountName: String) throws -> [String: Any] {
         let script = """
         tell application "Mail"
             set acc to account "\(escapeForAppleScript(accountName))"
@@ -126,8 +131,8 @@ actor MailController {
         end tell
         """
 
-        let enabled = try await runScript(enabledScript)
-        let emails = try await runScriptAsList(emailsScript)
+        let enabled = try runScript(enabledScript)
+        let emails = try runScriptAsList(emailsScript)
 
         return [
             "name": accountName,
@@ -139,7 +144,7 @@ actor MailController {
     // MARK: - Mailbox Operations
 
     /// List mailboxes for an account
-    func listMailboxes(accountName: String? = nil) async throws -> [[String: Any]] {
+    func listMailboxes(accountName: String? = nil) throws -> [[String: Any]] {
         let script: String
         if let account = accountName {
             script = """
@@ -188,7 +193,7 @@ actor MailController {
             """
         }
 
-        let names = try await runScriptAsList(namesScript)
+        let names = try runScriptAsList(namesScript)
 
         return names.map { name in
             var info: [String: Any] = ["name": name]
@@ -200,25 +205,25 @@ actor MailController {
     }
 
     /// Create a new mailbox
-    func createMailbox(name: String, accountName: String) async throws -> String {
+    func createMailbox(name: String, accountName: String) throws -> String {
         let script = """
         tell application "Mail"
             make new mailbox with properties {name:"\(escapeForAppleScript(name))"} at account "\(escapeForAppleScript(accountName))"
             return "Created mailbox: \(escapeForAppleScript(name))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Delete a mailbox
-    func deleteMailbox(name: String, accountName: String) async throws -> String {
+    func deleteMailbox(name: String, accountName: String) throws -> String {
         let script = """
         tell application "Mail"
             delete mailbox "\(escapeForAppleScript(name))" of account "\(escapeForAppleScript(accountName))"
             return "Deleted mailbox: \(escapeForAppleScript(name))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Email Operations
@@ -243,47 +248,48 @@ actor MailController {
         }
     }
 
-    /// Helper to build mailbox-scoped vectorized property fetch script
-    private func vectorizedFetchScript(property: String, mailbox: String, accountName: String, limit: Int) -> String {
-        """
+    /// List emails in a mailbox — single AppleScript call using vectorized property
+    /// access + text item delimiters for fast structured output.
+    func listEmails(mailbox: String, accountName: String, limit: Int = 50) throws -> [[String: Any]] {
+        let script = """
         tell application "Mail"
             set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
             set msgCount to count of messages of mb
-            if msgCount = 0 then return {}
+            if msgCount = 0 then return ""
             if \(limit) < msgCount then
                 set actualLimit to \(limit)
             else
                 set actualLimit to msgCount
             end if
-            get \(property) of messages 1 thru actualLimit of mb
+            set allIds to id of messages 1 thru actualLimit of mb
+            set allSubjects to subject of messages 1 thru actualLimit of mb
+            set allSenders to sender of messages 1 thru actualLimit of mb
+            set output to ""
+            repeat with i from 1 to actualLimit
+                if i > 1 then set output to output & "<<<>>>"
+                set output to output & (item i of allIds as string) & "|||" & item i of allSubjects & "|||" & item i of allSenders
+            end repeat
+            return output
         end tell
         """
-    }
 
-    /// List emails in a mailbox using vectorized property access (3 fast Apple Events)
-    func listEmails(mailbox: String, accountName: String, limit: Int = 50) async throws -> [[String: Any]] {
-        let ids = try await runScriptAsList(vectorizedFetchScript(property: "id", mailbox: mailbox, accountName: accountName, limit: limit))
-        guard !ids.isEmpty else { return [] }
+        let raw = try runScript(script)
+        let records = parseDelimitedRecords(raw, fieldCount: 3)
 
-        let subjects = try await runScriptAsList(vectorizedFetchScript(property: "subject", mailbox: mailbox, accountName: accountName, limit: limit))
-        let senders = try await runScriptAsList(vectorizedFetchScript(property: "sender", mailbox: mailbox, accountName: accountName, limit: limit))
-
-        var emails: [[String: Any]] = []
-        for i in 0..<min(ids.count, subjects.count, senders.count) {
-            emails.append([
-                "id": ids[i],
-                "subject": subjects[i],
-                "sender": senders[i]
-            ])
+        return records.map { fields in
+            [
+                "id": fields[0],
+                "subject": fields[1],
+                "sender": fields[2]
+            ] as [String: Any]
         }
-        return emails
     }
 
     /// Get email content by ID (single AppleScript call for metadata + content)
     /// - format: "html" (default) returns HTML body with links preserved;
     ///           "text" returns plain text content;
     ///           "source" returns full MIME source
-    func getEmail(id: String, mailbox: String, accountName: String, format: String = "html") async throws -> [String: Any] {
+    func getEmail(id: String, mailbox: String, accountName: String, format: String = "html") throws -> [String: Any] {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
 
         // Fetch metadata + content in a single AppleScript call
@@ -319,7 +325,7 @@ actor MailController {
         end tell
         """
 
-        let raw = try await runScript(script)
+        let raw = try runScript(script)
         let parts = raw.components(separatedBy: "<<<FIELD>>>")
 
         guard parts.count >= 7 else {
@@ -356,7 +362,7 @@ actor MailController {
 
     /// Batch get multiple emails by ID in a single AppleScript call
     /// Returns text content for each email (most token-efficient for LLM consumption)
-    func batchGetEmails(ids: [String], mailbox: String, accountName: String) async throws -> [[String: Any]] {
+    func batchGetEmails(ids: [String], mailbox: String, accountName: String) throws -> [[String: Any]] {
         guard !ids.isEmpty else { return [] }
 
         // Build AppleScript that fetches all emails in one tell block
@@ -389,7 +395,7 @@ actor MailController {
         end tell
         """
 
-        let raw = try await runScript(script)
+        let raw = try runScript(script)
         guard !raw.isEmpty else { return [] }
 
         let records = raw.components(separatedBy: "<<<REC>>>")
@@ -411,7 +417,7 @@ actor MailController {
     }
 
     /// Batch move multiple emails to a target mailbox in a single AppleScript call
-    func batchMoveEmails(ids: [String], fromMailbox: String, toMailbox: String, accountName: String) async throws -> String {
+    func batchMoveEmails(ids: [String], fromMailbox: String, toMailbox: String, accountName: String) throws -> String {
         guard !ids.isEmpty else { return "No emails to move" }
 
         let idsLiteral = ids.joined(separator: ", ")
@@ -432,11 +438,11 @@ actor MailController {
         end tell
         """
 
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Batch delete multiple emails in a single AppleScript call
-    func batchDeleteEmails(ids: [String], mailbox: String, accountName: String) async throws -> String {
+    func batchDeleteEmails(ids: [String], mailbox: String, accountName: String) throws -> String {
         guard !ids.isEmpty else { return "No emails to delete" }
 
         let idsLiteral = ids.joined(separator: ", ")
@@ -456,7 +462,7 @@ actor MailController {
         end tell
         """
 
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Extract HTML body from MIME source, falling back to plain text content
@@ -551,7 +557,7 @@ actor MailController {
     }
 
     /// Search emails
-    func searchEmails(query: String, mailbox: String? = nil, accountName: String? = nil, limit: Int = 20, sort: String = "desc") async throws -> [[String: Any]] {
+    func searchEmails(query: String, mailbox: String? = nil, accountName: String? = nil, limit: Int = 20, sort: String = "desc") throws -> [[String: Any]] {
         let escapedQuery = escapeForAppleScript(query)
         let sep = "⏐"  // Separator unlikely to appear in email fields
 
@@ -600,7 +606,7 @@ actor MailController {
             """
         }
 
-        let rows = try await runScriptAsList(script)
+        let rows = try runScriptAsList(script)
 
         var emails: [[String: Any]] = []
         for row in rows {
@@ -626,7 +632,7 @@ actor MailController {
     }
 
     /// Get unread count
-    func getUnreadCount(mailbox: String? = nil, accountName: String? = nil) async throws -> Int {
+    func getUnreadCount(mailbox: String? = nil, accountName: String? = nil) throws -> Int {
         let script: String
         if let mailbox = mailbox, let account = accountName {
             script = """
@@ -658,14 +664,14 @@ actor MailController {
             """
         }
 
-        let result = try await runScript(script)
+        let result = try runScript(script)
         return Int(result) ?? 0
     }
 
     // MARK: - Email Actions
 
     /// Mark email as read/unread
-    func markRead(id: String, mailbox: String, accountName: String, read: Bool) async throws -> String {
+    func markRead(id: String, mailbox: String, accountName: String, read: Bool) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -673,11 +679,11 @@ actor MailController {
             return "Email marked as \(read ? "read" : "unread")"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Flag email
-    func flagEmail(id: String, mailbox: String, accountName: String, flagged: Bool) async throws -> String {
+    func flagEmail(id: String, mailbox: String, accountName: String, flagged: Bool) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -685,11 +691,11 @@ actor MailController {
             return "Email \(flagged ? "flagged" : "unflagged")"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Move email to another mailbox
-    func moveEmail(id: String, fromMailbox: String, toMailbox: String, accountName: String) async throws -> String {
+    func moveEmail(id: String, fromMailbox: String, toMailbox: String, accountName: String) throws -> String {
         let ref = msgRef(id, mailbox: fromMailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -698,11 +704,11 @@ actor MailController {
             return "Email moved to \(escapeForAppleScript(toMailbox))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Delete email (move to trash)
-    func deleteEmail(id: String, mailbox: String, accountName: String) async throws -> String {
+    func deleteEmail(id: String, mailbox: String, accountName: String) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -710,7 +716,7 @@ actor MailController {
             return "Email deleted"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Compose Operations
@@ -733,7 +739,7 @@ actor MailController {
     }
 
     /// Compose and send a new email
-    func composeEmail(to: [String], subject: String, body: String, cc: [String]? = nil, bcc: [String]? = nil, attachments: [String]? = nil, accountName: String? = nil) async throws -> String {
+    func composeEmail(to: [String], subject: String, body: String, cc: [String]? = nil, bcc: [String]? = nil, attachments: [String]? = nil, accountName: String? = nil) throws -> String {
         if let attachments = attachments { try validateFilePaths(attachments) }
 
         var script = """
@@ -775,11 +781,11 @@ actor MailController {
         end tell
         """
 
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Reply to an email
-    func replyEmail(id: String, mailbox: String, accountName: String, body: String, replyAll: Bool = false) async throws -> String {
+    func replyEmail(id: String, mailbox: String, accountName: String, body: String, replyAll: Bool = false) throws -> String {
         let replyType = replyAll ? "reply all" : "reply"
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
@@ -793,11 +799,11 @@ actor MailController {
             return "Reply sent successfully"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Forward an email
-    func forwardEmail(id: String, mailbox: String, accountName: String, to: [String], body: String? = nil) async throws -> String {
+    func forwardEmail(id: String, mailbox: String, accountName: String, to: [String], body: String? = nil) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         var script = """
         tell application "Mail"
@@ -825,20 +831,20 @@ actor MailController {
         end tell
         """
 
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Draft Operations
 
     /// List drafts
-    func listDrafts(accountName: String) async throws -> [[String: Any]] {
+    func listDrafts(accountName: String) throws -> [[String: Any]] {
         let script = """
         tell application "Mail"
             get subject of messages of mailbox "Drafts" of account "\(escapeForAppleScript(accountName))"
         end tell
         """
 
-        let subjects = try await runScriptAsList(script)
+        let subjects = try runScriptAsList(script)
 
         return subjects.map { subject in
             ["subject": subject]
@@ -846,7 +852,7 @@ actor MailController {
     }
 
     /// Create a draft
-    func createDraft(to: [String], subject: String, body: String, attachments: [String]? = nil, accountName: String? = nil) async throws -> String {
+    func createDraft(to: [String], subject: String, body: String, attachments: [String]? = nil, accountName: String? = nil) throws -> String {
         if let attachments = attachments { try validateFilePaths(attachments) }
 
         var script = """
@@ -872,13 +878,13 @@ actor MailController {
         end tell
         """
 
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Attachment Operations
 
     /// List attachments of an email
-    func listAttachments(id: String, mailbox: String, accountName: String) async throws -> [[String: Any]] {
+    func listAttachments(id: String, mailbox: String, accountName: String) throws -> [[String: Any]] {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -898,7 +904,7 @@ actor MailController {
         end tell
         """
 
-        let names = try await runScriptAsList(namesScript)
+        let names = try runScriptAsList(namesScript)
 
         return names.map { name in
             ["name": name]
@@ -906,7 +912,7 @@ actor MailController {
     }
 
     /// Save attachment to disk
-    func saveAttachment(id: String, mailbox: String, accountName: String, attachmentName: String, savePath: String) async throws -> String {
+    func saveAttachment(id: String, mailbox: String, accountName: String, attachmentName: String, savePath: String) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -920,33 +926,33 @@ actor MailController {
             return "Attachment not found"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - VIP Operations
 
     /// List VIP senders
-    func listVIPSenders() async throws -> [String] {
+    func listVIPSenders() throws -> [String] {
         let script = """
         tell application "Mail"
             get sender of messages of mailbox "VIP"
         end tell
         """
 
-        return try await runScriptAsList(script)
+        return try runScriptAsList(script)
     }
 
     // MARK: - Rule Operations
 
     /// List mail rules
-    func listRules() async throws -> [[String: Any]] {
+    func listRules() throws -> [[String: Any]] {
         let script = """
         tell application "Mail"
             get name of every rule
         end tell
         """
 
-        let names = try await runScriptAsList(script)
+        let names = try runScriptAsList(script)
 
         return names.map { name in
             ["name": name]
@@ -954,18 +960,18 @@ actor MailController {
     }
 
     /// Enable/disable a rule
-    func enableRule(name: String, enabled: Bool) async throws -> String {
+    func enableRule(name: String, enabled: Bool) throws -> String {
         let script = """
         tell application "Mail"
             set enabled of rule "\(escapeForAppleScript(name))" to \(enabled)
             return "Rule '\(escapeForAppleScript(name))' \(enabled ? "enabled" : "disabled")"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Get detailed rule information
-    func getRuleDetails(name: String) async throws -> [String: Any] {
+    func getRuleDetails(name: String) throws -> [String: Any] {
         let enabledScript = """
         tell application "Mail"
             get enabled of rule "\(escapeForAppleScript(name))"
@@ -984,9 +990,9 @@ actor MailController {
         end tell
         """
 
-        let enabled = try await runScript(enabledScript) == "true"
-        let allConditions = try await runScript(allConditionsScript) == "true"
-        let stopEvaluating = try await runScript(stopScript) == "true"
+        let enabled = try runScript(enabledScript) == "true"
+        let allConditions = try runScript(allConditionsScript) == "true"
+        let stopEvaluating = try runScript(stopScript) == "true"
 
         return [
             "name": name,
@@ -997,7 +1003,7 @@ actor MailController {
     }
 
     /// Create a simple mail rule
-    func createRule(name: String, conditions: [[String: String]], actions: [String: Any]) async throws -> String {
+    func createRule(name: String, conditions: [[String: String]], actions: [String: Any]) throws -> String {
         var script = """
         tell application "Mail"
             set newRule to make new rule with properties {name:"\(escapeForAppleScript(name))"}
@@ -1046,24 +1052,24 @@ actor MailController {
         end tell
         """
 
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Delete a rule
-    func deleteRule(name: String) async throws -> String {
+    func deleteRule(name: String) throws -> String {
         let script = """
         tell application "Mail"
             delete rule "\(escapeForAppleScript(name))"
             return "Rule '\(escapeForAppleScript(name))' deleted"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Mail Check & Sync Operations
 
     /// Check for new mail
-    func checkForNewMail(accountName: String? = nil) async throws -> String {
+    func checkForNewMail(accountName: String? = nil) throws -> String {
         let script: String
         if let account = accountName {
             script = """
@@ -1080,24 +1086,24 @@ actor MailController {
             end tell
             """
         }
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Synchronize IMAP account
-    func synchronizeAccount(accountName: String) async throws -> String {
+    func synchronizeAccount(accountName: String) throws -> String {
         let script = """
         tell application "Mail"
             synchronize account "\(escapeForAppleScript(accountName))"
             return "Synchronizing account: \(escapeForAppleScript(accountName))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Advanced Email Operations
 
     /// Copy email to another mailbox
-    func copyEmail(id: String, fromMailbox: String, toMailbox: String, accountName: String) async throws -> String {
+    func copyEmail(id: String, fromMailbox: String, toMailbox: String, accountName: String) throws -> String {
         let ref = msgRef(id, mailbox: fromMailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -1106,11 +1112,11 @@ actor MailController {
             return "Email copied to \(escapeForAppleScript(toMailbox))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Set flag color (0-6: red, orange, yellow, green, blue, purple, gray; -1 to clear)
-    func setFlagColor(id: String, mailbox: String, accountName: String, colorIndex: Int) async throws -> String {
+    func setFlagColor(id: String, mailbox: String, accountName: String, colorIndex: Int) throws -> String {
         let colors = ["red", "orange", "yellow", "green", "blue", "purple", "gray"]
         let colorName = colorIndex >= 0 && colorIndex < colors.count ? colors[colorIndex] : "none"
 
@@ -1121,11 +1127,11 @@ actor MailController {
             return "Flag color set to \(colorName)"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Set email background color
-    func setBackgroundColor(id: String, mailbox: String, accountName: String, color: String) async throws -> String {
+    func setBackgroundColor(id: String, mailbox: String, accountName: String, color: String) throws -> String {
         // Valid colors: blue, gray, green, none, orange, purple, red, yellow
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
@@ -1134,11 +1140,11 @@ actor MailController {
             return "Background color set to \(color)"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Mark email as junk or not junk
-    func markAsJunk(id: String, mailbox: String, accountName: String, isJunk: Bool) async throws -> String {
+    func markAsJunk(id: String, mailbox: String, accountName: String, isJunk: Bool) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
@@ -1146,33 +1152,33 @@ actor MailController {
             return "Email marked as \(isJunk ? "junk" : "not junk")"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Get all email headers
-    func getEmailHeaders(id: String, mailbox: String, accountName: String) async throws -> String {
+    func getEmailHeaders(id: String, mailbox: String, accountName: String) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
             get all headers of \(ref)
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Get email source (raw message)
-    func getEmailSource(id: String, mailbox: String, accountName: String) async throws -> String {
+    func getEmailSource(id: String, mailbox: String, accountName: String) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         let script = """
         tell application "Mail"
             get source of \(ref)
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Redirect email (different from forward - keeps original sender)
-    func redirectEmail(id: String, mailbox: String, accountName: String, to: [String]) async throws -> String {
+    func redirectEmail(id: String, mailbox: String, accountName: String, to: [String]) throws -> String {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
         var script = """
         tell application "Mail"
@@ -1194,11 +1200,11 @@ actor MailController {
         end tell
         """
 
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Get email metadata (was forwarded, replied to, redirected)
-    func getEmailMetadata(id: String, mailbox: String, accountName: String) async throws -> [String: Any] {
+    func getEmailMetadata(id: String, mailbox: String, accountName: String) throws -> [String: Any] {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
 
         let forwardedScript = """
@@ -1231,11 +1237,11 @@ actor MailController {
         end tell
         """
 
-        let wasForwarded = try await runScript(forwardedScript) == "true"
-        let wasReplied = try await runScript(repliedScript) == "true"
-        let wasRedirected = try await runScript(redirectedScript) == "true"
-        let msgId = try await runScript(messageIdScript)
-        let size = try await runScript(sizeScript)
+        let wasForwarded = try runScript(forwardedScript) == "true"
+        let wasReplied = try runScript(repliedScript) == "true"
+        let wasRedirected = try runScript(redirectedScript) == "true"
+        let msgId = try runScript(messageIdScript)
+        let size = try runScript(sizeScript)
 
         return [
             "was_forwarded": wasForwarded,
@@ -1249,7 +1255,7 @@ actor MailController {
     // MARK: - Signature Operations
 
     /// List all signatures
-    func listSignatures() async throws -> [[String: Any]] {
+    func listSignatures() throws -> [[String: Any]] {
         // First check if there are any signatures
         let countScript = """
         tell application "Mail"
@@ -1257,7 +1263,7 @@ actor MailController {
         end tell
         """
 
-        let countResult = try await runScript(countScript)
+        let countResult = try runScript(countScript)
         guard let count = Int(countResult), count > 0 else {
             return []
         }
@@ -1268,7 +1274,7 @@ actor MailController {
         end tell
         """
 
-        let names = try await runScriptAsList(namesScript)
+        let names = try runScriptAsList(namesScript)
 
         return names.map { name in
             ["name": name]
@@ -1276,14 +1282,14 @@ actor MailController {
     }
 
     /// Get signature content
-    func getSignature(name: String) async throws -> [String: Any] {
+    func getSignature(name: String) throws -> [String: Any] {
         let contentScript = """
         tell application "Mail"
             get content of signature "\(escapeForAppleScript(name))"
         end tell
         """
 
-        let content = try await runScript(contentScript)
+        let content = try runScript(contentScript)
 
         return [
             "name": name,
@@ -1294,7 +1300,7 @@ actor MailController {
     // MARK: - SMTP Server Operations
 
     /// List SMTP servers
-    func listSMTPServers() async throws -> [[String: Any]] {
+    func listSMTPServers() throws -> [[String: Any]] {
         let namesScript = """
         tell application "Mail"
             get name of every smtp server
@@ -1307,8 +1313,8 @@ actor MailController {
         end tell
         """
 
-        let names = try await runScriptAsList(namesScript)
-        let serverNames = try await runScriptAsList(serverNamesScript)
+        let names = try runScriptAsList(namesScript)
+        let serverNames = try runScriptAsList(serverNamesScript)
 
         var servers: [[String: Any]] = []
         for i in 0..<names.count {
@@ -1325,7 +1331,7 @@ actor MailController {
     // MARK: - Special Mailboxes
 
     /// Get special mailboxes (inbox, drafts, sent, trash, junk, outbox)
-    func getSpecialMailboxes() async throws -> [String: Any] {
+    func getSpecialMailboxes() throws -> [String: Any] {
         let inboxScript = """
         tell application "Mail"
             get name of inbox
@@ -1363,41 +1369,41 @@ actor MailController {
         """
 
         return [
-            "inbox": try await runScript(inboxScript),
-            "drafts": try await runScript(draftsScript),
-            "sent": try await runScript(sentScript),
-            "trash": try await runScript(trashScript),
-            "junk": try await runScript(junkScript),
-            "outbox": try await runScript(outboxScript)
+            "inbox": try runScript(inboxScript),
+            "drafts": try runScript(draftsScript),
+            "sent": try runScript(sentScript),
+            "trash": try runScript(trashScript),
+            "junk": try runScript(junkScript),
+            "outbox": try runScript(outboxScript)
         ]
     }
 
     // MARK: - Address Operations
 
     /// Extract name from email address
-    func extractNameFromAddress(address: String) async throws -> String {
+    func extractNameFromAddress(address: String) throws -> String {
         let script = """
         tell application "Mail"
             extract name from "\(escapeForAppleScript(address))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     /// Extract email address from full address string
-    func extractAddressFrom(address: String) async throws -> String {
+    func extractAddressFrom(address: String) throws -> String {
         let script = """
         tell application "Mail"
             extract address from "\(escapeForAppleScript(address))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Application Operations
 
     /// Get Mail application info
-    func getMailAppInfo() async throws -> [String: Any] {
+    func getMailAppInfo() throws -> [String: Any] {
         let versionScript = """
         tell application "Mail"
             get application version
@@ -1416,9 +1422,9 @@ actor MailController {
         end tell
         """
 
-        let version = try await runScript(versionScript)
-        let fetchInterval = try await runScript(fetchIntervalScript)
-        let bgCount = try await runScript(backgroundCountScript)
+        let version = try runScript(versionScript)
+        let fetchInterval = try runScript(fetchIntervalScript)
+        let bgCount = try runScript(backgroundCountScript)
 
         return [
             "version": version,
@@ -1428,27 +1434,27 @@ actor MailController {
     }
 
     /// Open mailto URL
-    func openMailtoURL(url: String) async throws -> String {
+    func openMailtoURL(url: String) throws -> String {
         let script = """
         tell application "Mail"
             mailto "\(escapeForAppleScript(url))"
             return "Opened mailto URL"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Import/Export Operations
 
     /// Import mailbox from file
-    func importMailbox(path: String) async throws -> String {
+    func importMailbox(path: String) throws -> String {
         let script = """
         tell application "Mail"
             import Mail mailbox POSIX file "\(escapeForAppleScript(path))"
             return "Mailbox imported from \(escapeForAppleScript(path))"
         end tell
         """
-        return try await runScript(script)
+        return try runScript(script)
     }
 
     // MARK: - Helpers
