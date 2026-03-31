@@ -250,10 +250,11 @@ actor MailController {
 
     /// List emails in a mailbox — single AppleScript call using vectorized property
     /// access + text item delimiters for fast structured output.
-    func listEmails(mailbox: String, accountName: String, limit: Int = 50) throws -> [[String: Any]] {
+    func listEmails(mailbox: String, accountName: String? = nil, limit: Int = 50) throws -> [[String: Any]] {
+        let mbRef = mailboxRef(mailbox, account: accountName)
         let script = """
         tell application "Mail"
-            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
+            set mb to \(mbRef)
             set msgCount to count of messages of mb
             if msgCount = 0 then return ""
             if \(limit) < msgCount then
@@ -289,7 +290,7 @@ actor MailController {
     /// - format: "html" (default) returns HTML body with links preserved;
     ///           "text" returns plain text content;
     ///           "source" returns full MIME source
-    func getEmail(id: String, mailbox: String, accountName: String, format: String = "html") throws -> [String: Any] {
+    func getEmail(id: String, mailbox: String, accountName: String? = nil, format: String = "html") throws -> [String: Any] {
         let ref = msgRef(id, mailbox: mailbox, account: accountName)
 
         // Fetch metadata + content in a single AppleScript call
@@ -362,14 +363,15 @@ actor MailController {
 
     /// Batch get multiple emails by ID in a single AppleScript call
     /// Returns text content for each email (most token-efficient for LLM consumption)
-    func batchGetEmails(ids: [String], mailbox: String, accountName: String) throws -> [[String: Any]] {
+    func batchGetEmails(ids: [String], mailbox: String, accountName: String? = nil) throws -> [[String: Any]] {
         guard !ids.isEmpty else { return [] }
 
         // Build AppleScript that fetches all emails in one tell block
+        let mbRef = mailboxRef(mailbox, account: accountName)
         let idsLiteral = ids.joined(separator: ", ")
         let script = """
         tell application "Mail"
-            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
+            set mb to \(mbRef)
             set idList to {\(idsLiteral)}
             set output to ""
             repeat with targetId in idList
@@ -417,14 +419,16 @@ actor MailController {
     }
 
     /// Batch move multiple emails to a target mailbox in a single AppleScript call
-    func batchMoveEmails(ids: [String], fromMailbox: String, toMailbox: String, accountName: String) throws -> String {
+    func batchMoveEmails(ids: [String], fromMailbox: String, toMailbox: String, accountName: String? = nil) throws -> String {
         guard !ids.isEmpty else { return "No emails to move" }
 
+        let fromRef = mailboxRef(fromMailbox, account: accountName)
+        let toRef = mailboxRef(toMailbox, account: accountName)
         let idsLiteral = ids.joined(separator: ", ")
         let script = """
         tell application "Mail"
-            set mb to mailbox "\(escapeForAppleScript(fromMailbox))" of account "\(escapeForAppleScript(accountName))"
-            set targetMb to mailbox "\(escapeForAppleScript(toMailbox))" of account "\(escapeForAppleScript(accountName))"
+            set mb to \(fromRef)
+            set targetMb to \(toRef)
             set idList to {\(idsLiteral)}
             set movedCount to 0
             repeat with targetId in idList
@@ -442,13 +446,14 @@ actor MailController {
     }
 
     /// Batch delete multiple emails in a single AppleScript call
-    func batchDeleteEmails(ids: [String], mailbox: String, accountName: String) throws -> String {
+    func batchDeleteEmails(ids: [String], mailbox: String, accountName: String? = nil) throws -> String {
         guard !ids.isEmpty else { return "No emails to delete" }
 
+        let mbRef = mailboxRef(mailbox, account: accountName)
         let idsLiteral = ids.joined(separator: ", ")
         let script = """
         tell application "Mail"
-            set mb to mailbox "\(escapeForAppleScript(mailbox))" of account "\(escapeForAppleScript(accountName))"
+            set mb to \(mbRef)
             set idList to {\(idsLiteral)}
             set deletedCount to 0
             repeat with targetId in idList
@@ -1459,12 +1464,22 @@ actor MailController {
 
     // MARK: - Helpers
 
+    /// Generate AppleScript reference for a mailbox, with optional account.
+    /// When accountName is nil, references a top-level (local/On My Mac) mailbox.
+    private func mailboxRef(_ mailbox: String, account: String?) -> String {
+        if let account = account {
+            return "mailbox \"\(escapeForAppleScript(mailbox))\" of account \"\(escapeForAppleScript(account))\""
+        } else {
+            return "mailbox \"\(escapeForAppleScript(mailbox))\""
+        }
+    }
+
     /// Generate AppleScript reference to find a message by its numeric id.
     /// Apple Mail's `message id` refers to the RFC822 Message-ID (string),
     /// but `id` is the internal numeric identifier returned by search/list.
     /// We must use `first message ... whose id is N` instead of `message id N`.
-    private func msgRef(_ id: String, mailbox: String, account: String) -> String {
-        return "(first message of mailbox \"\(escapeForAppleScript(mailbox))\" of account \"\(escapeForAppleScript(account))\" whose id is \(id))"
+    private func msgRef(_ id: String, mailbox: String, account: String?) -> String {
+        return "(first message of \(mailboxRef(mailbox, account: account)) whose id is \(id))"
     }
 
     /// Escape special characters for AppleScript strings.
