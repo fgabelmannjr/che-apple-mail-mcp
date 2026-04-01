@@ -50,25 +50,25 @@ class CheAppleMailMCPServer {
             // Mailbox Tools
             Tool(
                 name: "list_mailboxes",
-                description: "List all mailboxes (folders) for an account. When listing all accounts, results are served from a durable cache for speed. Use refresh=true to force re-query.",
+                description: "List all mailboxes (folders). Omit account_name to list ALL mailboxes including local 'On My Mac' mailboxes. Local mailboxes include a 'full_path' field for use with move_email and create_mailbox. Cached for speed; use refresh=true to force re-query.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
-                        "account_name": .object(["type": .string("string"), "description": .string("The name of the mail account (optional, lists all if omitted)")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("The name of the mail account (optional — omit to list all including local 'On My Mac' mailboxes)")]),
                         "refresh": .object(["type": .string("boolean"), "description": .string("Force refresh the mailbox cache (default: false)")])
                     ])
                 ])
             ),
             Tool(
                 name: "create_mailbox",
-                description: "Create a new mailbox (folder) in an account",
+                description: "Create a new mailbox (folder). Omit account_name to create a local 'On My Mac' mailbox. Use '/' in the name for nested local mailboxes (e.g., 'Racecraft/NewFolder').",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
-                        "name": .object(["type": .string("string"), "description": .string("Name of the new mailbox")]),
-                        "account_name": .object(["type": .string("string"), "description": .string("The account to create the mailbox in")])
+                        "name": .object(["type": .string("string"), "description": .string("Name of the new mailbox (use '/' for nested local paths, e.g., 'Racecraft/SubFolder')")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("The account to create the mailbox in (optional — omit for local 'On My Mac' mailboxes)")])
                     ]),
-                    "required": .array([.string("name"), .string("account_name")])
+                    "required": .array([.string("name")])
                 ])
             ),
             Tool(
@@ -172,16 +172,17 @@ class CheAppleMailMCPServer {
             ),
             Tool(
                 name: "move_email",
-                description: "Move an email to another mailbox",
+                description: "Move an email to another mailbox. Supports account-to-account, account-to-local ('On My Mac'), local-to-account, and local-to-local moves. For local mailbox paths, use '/' separators (e.g., 'Racecraft/Vendors/Tavily').",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
                         "id": .object(["type": .string("string"), "description": .string("The email ID")]),
                         "from_mailbox": .object(["type": .string("string"), "description": .string("Source mailbox")]),
-                        "to_mailbox": .object(["type": .string("string"), "description": .string("Destination mailbox")]),
-                        "account_name": .object(["type": .string("string"), "description": .string("The mail account")])
+                        "to_mailbox": .object(["type": .string("string"), "description": .string("Destination mailbox (use '/' for nested local paths, e.g., 'Racecraft/Vendors')")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("Source account (optional — omit for local 'On My Mac' source mailboxes)")]),
+                        "to_account_name": .object(["type": .string("string"), "description": .string("Destination account (optional — omit for local 'On My Mac' destination mailboxes)")])
                     ]),
-                    "required": .array([.string("id"), .string("from_mailbox"), .string("to_mailbox"), .string("account_name")])
+                    "required": .array([.string("id"), .string("from_mailbox"), .string("to_mailbox")])
                 ])
             ),
             Tool(
@@ -461,14 +462,15 @@ class CheAppleMailMCPServer {
             ),
             Tool(
                 name: "batch_move_emails",
-                description: "Move multiple emails to another mailbox in a single call. Much faster than calling move_email repeatedly. Omit account_name for local mailboxes.",
+                description: "Move multiple emails to another mailbox in a single call. Much faster than calling move_email repeatedly. Supports cross-account and local 'On My Mac' destinations. Use '/' in to_mailbox for nested local paths.",
                 inputSchema: .object([
                     "type": .string("object"),
                     "properties": .object([
                         "ids": .object(["type": .string("array"), "items": .object(["type": .string("string")]), "description": .string("Array of email IDs to move")]),
                         "from_mailbox": .object(["type": .string("string"), "description": .string("Source mailbox")]),
-                        "to_mailbox": .object(["type": .string("string"), "description": .string("Destination mailbox")]),
-                        "account_name": .object(["type": .string("string"), "description": .string("The mail account (optional — omit for local mailboxes)")])
+                        "to_mailbox": .object(["type": .string("string"), "description": .string("Destination mailbox (use '/' for nested local paths)")]),
+                        "account_name": .object(["type": .string("string"), "description": .string("Source account (optional — omit for local mailboxes)")]),
+                        "to_account_name": .object(["type": .string("string"), "description": .string("Destination account (optional — omit for local 'On My Mac' destination)")])
                     ]),
                     "required": .array([.string("ids"), .string("from_mailbox"), .string("to_mailbox")])
                 ])
@@ -707,10 +709,10 @@ class CheAppleMailMCPServer {
             return formatJSON(mailboxes)
 
         case "create_mailbox":
-            guard let name = arguments["name"]?.stringValue,
-                  let accountName = arguments["account_name"]?.stringValue else {
-                throw MailError.invalidParameter("name and account_name are required")
+            guard let name = arguments["name"]?.stringValue else {
+                throw MailError.invalidParameter("name is required")
             }
+            let accountName = arguments["account_name"]?.stringValue
             return try await mailController.createMailbox(name: name, accountName: accountName)
 
         case "delete_mailbox":
@@ -781,11 +783,12 @@ class CheAppleMailMCPServer {
         case "move_email":
             guard let id = arguments["id"]?.stringValue,
                   let fromMailbox = arguments["from_mailbox"]?.stringValue,
-                  let toMailbox = arguments["to_mailbox"]?.stringValue,
-                  let accountName = arguments["account_name"]?.stringValue else {
-                throw MailError.invalidParameter("id, from_mailbox, to_mailbox, and account_name are required")
+                  let toMailbox = arguments["to_mailbox"]?.stringValue else {
+                throw MailError.invalidParameter("id, from_mailbox, and to_mailbox are required")
             }
-            return try await mailController.moveEmail(id: id, fromMailbox: fromMailbox, toMailbox: toMailbox, accountName: accountName)
+            let accountName = arguments["account_name"]?.stringValue
+            let toAccountName = arguments["to_account_name"]?.stringValue
+            return try await mailController.moveEmail(id: id, fromMailbox: fromMailbox, toMailbox: toMailbox, accountName: accountName, toAccountName: toAccountName)
 
         case "delete_email":
             guard let id = arguments["id"]?.stringValue,
@@ -986,8 +989,9 @@ class CheAppleMailMCPServer {
                 throw MailError.invalidParameter("ids, from_mailbox, and to_mailbox are required")
             }
             let accountName = arguments["account_name"]?.stringValue
+            let toAccountName = arguments["to_account_name"]?.stringValue
             let ids = idsArray.compactMap { $0.stringValue }
-            return try await mailController.batchMoveEmails(ids: ids, fromMailbox: fromMailbox, toMailbox: toMailbox, accountName: accountName)
+            return try await mailController.batchMoveEmails(ids: ids, fromMailbox: fromMailbox, toMailbox: toMailbox, accountName: accountName, toAccountName: toAccountName)
 
         case "batch_delete_emails":
             guard let idsArray = arguments["ids"]?.arrayValue,

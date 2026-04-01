@@ -5,7 +5,9 @@ import Foundation
 /// Cached mailbox entry for durable mailbox-to-account mapping
 struct CachedMailbox: Codable {
     let name: String
-    let accountName: String
+    let accountName: String  // empty string "" for local "On My Mac" mailboxes
+    /// Full path for nested local mailboxes (e.g., "Racecraft/Vendors/Tavily")
+    let fullPath: String?
 }
 
 /// Persistent mailbox cache stored in UserDefaults
@@ -44,9 +46,11 @@ actor MailController {
         }
     }
 
-    /// Query all mailboxes from AppleScript and update the durable cache
+    /// Query all mailboxes from AppleScript and update the durable cache.
+    /// Includes both account mailboxes and local "On My Mac" mailboxes.
     private func refreshMailboxCache() throws -> MailboxCache {
-        let script = """
+        // Step 1: Get all account mailboxes
+        let accountScript = """
         tell application "Mail"
             set output to ""
             repeat with acc in accounts
@@ -59,11 +63,64 @@ actor MailController {
             return output
         end tell
         """
-        let raw = try runScript(script)
-        let records = parseDelimitedRecords(raw, fieldCount: 2)
-        let cached = records.map { fields in
-            CachedMailbox(name: fields[1], accountName: fields[0])
+        let accountRaw = try runScript(accountScript)
+        let accountRecords = parseDelimitedRecords(accountRaw, fieldCount: 2)
+        var cached = accountRecords.map { fields in
+            CachedMailbox(name: fields[1], accountName: fields[0], fullPath: nil)
         }
+
+        // Step 2: Get local "On My Mac" mailboxes.
+        // Strategy: get all top-level mailbox names, then subtract known account mailbox names.
+        // Local mailboxes are the remainder. Then recurse into children of local mailboxes.
+        let localScript = """
+        tell application "Mail"
+            -- Build a set of all account-owned mailbox names (as a delimited string for fast lookup)
+            set acctBoxNames to ""
+            repeat with acc in accounts
+                repeat with mb in mailboxes of acc
+                    set acctBoxNames to acctBoxNames & "||" & (name of mb) & "||"
+                end repeat
+            end repeat
+
+            set output to ""
+            set topBoxes to every mailbox
+
+            repeat with mb in topBoxes
+                set mbName to name of mb
+                -- Skip if this name appears in account mailboxes
+                if acctBoxNames does not contain ("||" & mbName & "||") then
+                    if output is not "" then set output to output & "<<<>>>"
+                    set output to output & mbName & "|||" & mbName
+                    -- Walk one level of children
+                    try
+                        set children to every mailbox of mb
+                        repeat with child in children
+                            set childName to name of child
+                            set childPath to mbName & "/" & childName
+                            set output to output & "<<<>>>" & childName & "|||" & childPath
+                            -- Walk grandchildren (depth 2)
+                            try
+                                set grandchildren to every mailbox of child
+                                repeat with gc in grandchildren
+                                    set gcName to name of gc
+                                    set gcPath to childPath & "/" & gcName
+                                    set output to output & "<<<>>>" & gcName & "|||" & gcPath
+                                end repeat
+                            end try
+                        end repeat
+                    end try
+                end if
+            end repeat
+            return output
+        end tell
+        """
+        let localRaw = try runScript(localScript)
+        let localRecords = parseDelimitedRecords(localRaw, fieldCount: 2)
+        let localCached = localRecords.map { fields in
+            CachedMailbox(name: fields[0], accountName: "", fullPath: fields[1])
+        }
+        cached.append(contentsOf: localCached)
+
         let cache = MailboxCache(lastUpdated: Date(), mailboxes: cached)
         saveMailboxCache(cache)
         return cache
@@ -203,7 +260,8 @@ actor MailController {
     // MARK: - Mailbox Operations
 
     /// List mailboxes for an account.
-    /// When accountName is nil (all accounts), uses a durable UserDefaults cache.
+    /// When accountName is nil (all accounts), uses a durable UserDefaults cache
+    /// and includes local "On My Mac" mailboxes.
     /// Set refresh=true to force re-querying AppleScript and updating the cache.
     func listMailboxes(accountName: String? = nil, refresh: Bool = false) throws -> [[String: Any]] {
         if let account = accountName {
@@ -218,42 +276,74 @@ actor MailController {
                 ["name": name, "account_name": account] as [String: Any]
             }
         } else {
-            // All-accounts query: use durable cache
+            // All-accounts query: use durable cache (includes local mailboxes)
             let cache: MailboxCache
+            let isCached: Bool
             if !refresh, let existing = loadMailboxCache() {
                 cache = existing
-                let cacheAge = Date().timeIntervalSince(cache.lastUpdated)
-                return cache.mailboxes.map { mb in
-                    [
-                        "name": mb.name,
-                        "account_name": mb.accountName,
-                        "cached": true,
-                        "cache_age_seconds": Int(cacheAge)
-                    ] as [String: Any]
-                }
+                isCached = true
             } else {
                 cache = try refreshMailboxCache()
-                return cache.mailboxes.map { mb in
-                    [
-                        "name": mb.name,
-                        "account_name": mb.accountName,
-                        "cached": false,
-                        "cache_age_seconds": 0
-                    ] as [String: Any]
+                isCached = false
+            }
+            let cacheAge = Date().timeIntervalSince(cache.lastUpdated)
+            return cache.mailboxes.map { mb in
+                var entry: [String: Any] = [
+                    "name": mb.name,
+                    "cached": isCached,
+                    "cache_age_seconds": isCached ? Int(cacheAge) : 0
+                ]
+                if mb.accountName.isEmpty {
+                    entry["location"] = "On My Mac"
+                    if let fullPath = mb.fullPath {
+                        entry["full_path"] = fullPath
+                    }
+                } else {
+                    entry["account_name"] = mb.accountName
                 }
+                return entry
             }
         }
     }
 
-    /// Create a new mailbox
-    func createMailbox(name: String, accountName: String) throws -> String {
-        let script = """
-        tell application "Mail"
-            make new mailbox with properties {name:"\(escapeForAppleScript(name))"} at account "\(escapeForAppleScript(accountName))"
-            return "Created mailbox: \(escapeForAppleScript(name))"
-        end tell
-        """
-        return try runScript(script)
+    /// Create a new mailbox.
+    /// When accountName is nil, creates a local "On My Mac" mailbox.
+    /// The name can be a path like "Racecraft/Vendors/NewFolder" for nested local mailboxes.
+    func createMailbox(name: String, accountName: String? = nil) throws -> String {
+        if let accountName = accountName {
+            let script = """
+            tell application "Mail"
+                make new mailbox with properties {name:"\(escapeForAppleScript(name))"} at account "\(escapeForAppleScript(accountName))"
+                return "Created mailbox: \(escapeForAppleScript(name))"
+            end tell
+            """
+            return try runScript(script)
+        } else {
+            // Local mailbox creation
+            let components = name.components(separatedBy: "/")
+            if components.count == 1 {
+                // Top-level local mailbox
+                let script = """
+                tell application "Mail"
+                    make new mailbox with properties {name:"\(escapeForAppleScript(name))"}
+                    return "Created local mailbox: \(escapeForAppleScript(name))"
+                end tell
+                """
+                return try runScript(script)
+            } else {
+                // Nested local mailbox: parent must exist
+                let parentPath = components.dropLast().joined(separator: "/")
+                let childName = components.last!
+                let parentRef = localMailboxRef(parentPath)
+                let script = """
+                tell application "Mail"
+                    make new mailbox with properties {name:"\(escapeForAppleScript(childName))"} at \(parentRef)
+                    return "Created local mailbox: \(escapeForAppleScript(name))"
+                end tell
+                """
+                return try runScript(script)
+            }
+        }
     }
 
     /// Delete a mailbox
@@ -513,12 +603,24 @@ actor MailController {
         }
     }
 
-    /// Batch move multiple emails to a target mailbox in a single AppleScript call
-    func batchMoveEmails(ids: [String], fromMailbox: String, toMailbox: String, accountName: String? = nil) throws -> String {
+    /// Batch move multiple emails to a target mailbox in a single AppleScript call.
+    /// Supports cross-account and local mailbox destinations via toAccountName.
+    func batchMoveEmails(ids: [String], fromMailbox: String, toMailbox: String, accountName: String? = nil, toAccountName: String? = nil) throws -> String {
         guard !ids.isEmpty else { return "No emails to move" }
 
         let fromRef = mailboxRef(fromMailbox, account: accountName)
-        let toRef = mailboxRef(toMailbox, account: accountName)
+        let toRef: String
+        if let toAccount = toAccountName {
+            toRef = mailboxRef(toMailbox, account: toAccount)
+        } else if accountName != nil && toAccountName == nil && !toMailbox.contains("/") {
+            toRef = mailboxRef(toMailbox, account: accountName)
+        } else {
+            if toMailbox.contains("/") {
+                toRef = localMailboxRef(toMailbox)
+            } else {
+                toRef = "mailbox \"\(escapeForAppleScript(toMailbox))\""
+            }
+        }
         let idsLiteral = ids.joined(separator: ", ")
         let script = """
         tell application "Mail"
@@ -794,13 +896,34 @@ actor MailController {
         return try runScript(script)
     }
 
-    /// Move email to another mailbox
-    func moveEmail(id: String, fromMailbox: String, toMailbox: String, accountName: String) throws -> String {
+    /// Move email to another mailbox.
+    /// - accountName: source account (nil for local source mailbox)
+    /// - toAccountName: destination account (nil for local destination mailbox)
+    /// - toMailbox: destination mailbox name, or a "/" separated path for nested local mailboxes
+    ///   (e.g., "Racecraft/Vendors/Tavily")
+    func moveEmail(id: String, fromMailbox: String, toMailbox: String, accountName: String? = nil, toAccountName: String? = nil) throws -> String {
         let ref = msgRef(id, mailbox: fromMailbox, account: accountName)
+
+        let destRef: String
+        if let toAccount = toAccountName {
+            // Destination is an account mailbox
+            destRef = mailboxRef(toMailbox, account: toAccount)
+        } else if accountName != nil && toAccountName == nil && !toMailbox.contains("/") {
+            // Legacy behavior: same account, simple mailbox name
+            destRef = mailboxRef(toMailbox, account: accountName)
+        } else {
+            // Destination is a local "On My Mac" mailbox (possibly nested path)
+            if toMailbox.contains("/") {
+                destRef = localMailboxRef(toMailbox)
+            } else {
+                destRef = "mailbox \"\(escapeForAppleScript(toMailbox))\""
+            }
+        }
+
         let script = """
         tell application "Mail"
             set msg to \(ref)
-            move msg to mailbox "\(escapeForAppleScript(toMailbox))" of account "\(escapeForAppleScript(accountName))"
+            move msg to \(destRef)
             return "Email moved to \(escapeForAppleScript(toMailbox))"
         end tell
         """
@@ -1703,12 +1826,31 @@ actor MailController {
 
     /// Generate AppleScript reference for a mailbox, with optional account.
     /// When accountName is nil, references a top-level (local/On My Mac) mailbox.
+    /// For nested local mailboxes, use `localMailboxRef(_:)` instead.
     private func mailboxRef(_ mailbox: String, account: String?) -> String {
         if let account = account {
             return "mailbox \"\(escapeForAppleScript(mailbox))\" of account \"\(escapeForAppleScript(account))\""
         } else {
             return "mailbox \"\(escapeForAppleScript(mailbox))\""
         }
+    }
+
+    /// Generate AppleScript reference for a local "On My Mac" mailbox from a path string.
+    /// Converts "Racecraft/Vendors/Tavily" to:
+    ///   `mailbox "Tavily" of mailbox "Vendors" of mailbox "Racecraft"`
+    /// A single-component path like "Racecraft" returns `mailbox "Racecraft"`.
+    private func localMailboxRef(_ path: String) -> String {
+        let components = path.components(separatedBy: "/").filter { !$0.isEmpty }
+        guard !components.isEmpty else { return "mailbox \"\"" }
+        // AppleScript nesting is innermost-first: the leaf comes first, root last
+        // "Racecraft/Vendors/Tavily" → mailbox "Tavily" of mailbox "Vendors" of mailbox "Racecraft"
+        return components.reversed().enumerated().map { (index, name) in
+            if index == 0 {
+                return "mailbox \"\(escapeForAppleScript(name))\""
+            } else {
+                return "of mailbox \"\(escapeForAppleScript(name))\""
+            }
+        }.joined(separator: " ")
     }
 
     /// Generate AppleScript reference to find a message by its numeric id.
